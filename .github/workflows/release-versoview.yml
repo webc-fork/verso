@@ -54,7 +54,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.0
 
       - name: Build
         run: cargo build --profile release-lto
@@ -90,7 +90,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.0
 
       # Mozangle needs Clang 19+
       # see https://github.com/tauri-apps/verso/actions/runs/15916377747/job/44894669786?pr=20
@@ -134,7 +134,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.0
 
       - name: Install dependencies
         run: |
