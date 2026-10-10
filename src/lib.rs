@@ -26,7 +26,7 @@ pub mod webview;
 pub mod window;
 pub use errors::{Error, Result};
 /// Utilities to write tests.
-// pub mod test;
+pub mod test;
 pub use verso::Verso;
 /// Re-exporting Winit for the sake of convenience.
 pub use winit;

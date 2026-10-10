@@ -325,6 +325,9 @@ impl Config {
             maximized: !cli_args.no_maximized,
             position: cli_args.position.map(Into::into),
             inner_size: cli_args.inner_size.map(Into::into),
+            // Launch without a visible window when `VERSO_HEADLESS` is set.
+            // Useful for integration tests and other automations.
+            visible: std::env::var("VERSO_HEADLESS").map_or(true, |v| v != "1"),
             ..Default::default()
         })
     }

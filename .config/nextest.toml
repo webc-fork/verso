@@ -1,0 +1,8 @@
+# cargo-nextest configuration.
+# See https://nexte.st/docs/configuration/ for all options.
+
+[profile.default]
+# The GUI smoke test spawns a full servo instance. Mark it slow after 60s
+# and terminate it after 2 slow periods (120s total) so a hung servo
+# instance cannot block the whole test run.
+slow-timeout = { period = "60s", terminate-after = 2 }

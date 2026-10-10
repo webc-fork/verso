@@ -1286,16 +1286,16 @@ use raw_window_handle::{AppKitWindowHandle, RawWindowHandle};
 /// Window decoration for macOS.
 #[cfg(macos)]
 pub unsafe fn decorate_window(view: *mut AnyObject, _position: LogicalPosition<f64>) {
-    use objc2::rc::Id;
+    use objc2::rc::Retained;
     use objc2_app_kit::{NSView, NSWindowStyleMask, NSWindowTitleVisibility};
 
-    let ns_view: Id<NSView> = unsafe { Id::retain(view.cast()) }.unwrap();
+    let ns_view: Retained<NSView> = unsafe { Retained::retain(view.cast()) }.unwrap();
     let window = ns_view
         .window()
         .expect("view was not installed in a window");
     window.setMovable(false); // let panel UI handle window moving
     window.setTitlebarAppearsTransparent(true);
-    window.setTitleVisibility(NSWindowTitleVisibility::NSWindowTitleHidden);
+    window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
     window.setStyleMask(
         NSWindowStyleMask::Titled
             | NSWindowStyleMask::FullSizeContentView

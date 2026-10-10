@@ -126,7 +126,7 @@ impl ContextMenu {
                 RawWindowHandle::AppKit(handle) => {
                     // use objc2
                     assert!(
-                        objc2_foundation::is_main_thread(),
+                        objc2::MainThreadMarker::new().is_some(),
                         "can only access AppKit handles on the main thread"
                     );
                     let ns_view = handle.ns_view.as_ptr();

@@ -1,4 +1,4 @@
-/// Simple test harness for testing `verso`.
+/// Simple test harness for testing `versoview`.
 ///
 /// Add your test to `Cargo.toml` with the `harness = false` option. This will prevent Rust's default test harness from running your test.
 ///
@@ -8,17 +8,17 @@
 /// harness = false
 /// ```
 ///
-/// Then, in your test, use the `verso_test!` macro to run your tests. The tests must be functions that take an `EventLoopWindowTarget`.
+/// Then, in your test, use the `verso_test!` macro to run your tests. The tests must be functions that take an `ActiveEventLoop`.
 ///
 /// ```rust
-/// use verso::verso_test;
-/// use verso::winit::event_loop::EventLoopWindowTarget;
+/// use versoview::verso_test;
+/// use versoview::winit::event_loop::ActiveEventLoop;
 ///
-/// fn my_test(elwt: &EventLoopWindowTarget<()>) {
+/// fn my_test(elwt: &ActiveEventLoop) {
 ///     // ...
 /// }
 ///
-/// fn other_test(elwt: &EventLoopWindowTarget<()>) {
+/// fn other_test(elwt: &ActiveEventLoop) {
 ///     // ...
 /// }
 ///
@@ -32,7 +32,17 @@ macro_rules! verso_test {
                 $crate::__verso_test_internal_collect_test!($test)
             ),*];
 
-            $crate::test::__private::run(TESTS, ());
+            // Test runners like cargo-nextest list a harness-less binary by
+            // invoking it with `--list`; answer in the libtest format instead
+            // of starting the event loop.
+            if std::env::args().any(|arg| arg == "--list") {
+                for test in TESTS {
+                    println!("{}: test", test.name);
+                }
+                return Ok(());
+            }
+
+            $crate::test::__private::run(TESTS);
             Ok(())
         }
     };
@@ -52,16 +62,15 @@ macro_rules! __verso_test_internal_collect_test {
 #[doc(hidden)]
 // This module is forked from winit-test.
 pub mod __private {
-    use winit::event_loop::EventLoop;
-    pub use winit::event_loop::EventLoopWindowTarget;
+    use winit::application::ApplicationHandler;
+    use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 
-    use owo_colors::OwoColorize;
     use std::any::Any;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Instant;
-    use winit::window::WindowBuilder;
 
-    use crate::{Status, Verso};
+    use crate::Verso;
+    use crate::verso::EventLoopProxyMessage;
 
     pub type Context = ();
 
@@ -70,47 +79,103 @@ pub mod __private {
         panics: Vec<(&'static str, Box<dyn Any + Send>)>,
         start: Instant,
         run: bool,
-        code: i32,
+    }
+
+    struct TestApp {
+        tests: &'static [VersoBasedTest],
+        verso: Option<Verso>,
+        proxy: EventLoopProxy<EventLoopProxyMessage>,
+        state: State,
+    }
+
+    impl ApplicationHandler<EventLoopProxyMessage> for TestApp {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            self.verso = Some(Verso::new(event_loop, self.proxy.clone()));
+        }
+
+        fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            // Run the tests (and terminate) once the event loop is up and
+            // running. `ActiveEventLoop::exit` is unreliable when called from
+            // inside a callback, and servo's background threads keep running
+            // anyway, so flush output and terminate the process directly.
+            if !self.state.run {
+                run_internal(self.tests, &mut self.state, event_loop);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let code = if self.state.panics.is_empty() { 0 } else { 1 };
+                std::process::exit(code);
+            }
+        }
+
+        fn window_event(
+            &mut self,
+            event_loop: &ActiveEventLoop,
+            window_id: winit::window::WindowId,
+            event: winit::event::WindowEvent,
+        ) {
+            if let Some(v) = self.verso.as_mut() {
+                v.handle_window_event(event_loop, window_id, event);
+            }
+        }
+
+        fn user_event(&mut self, event_loop: &ActiveEventLoop, event: EventLoopProxyMessage) {
+            if let Some(v) = self.verso.as_mut() {
+                match event {
+                    EventLoopProxyMessage::Wake => v.request_redraw(event_loop),
+                    EventLoopProxyMessage::IpcMessage(message) => {
+                        v.handle_incoming_webview_message(event_loop, *message);
+                    }
+                }
+            }
+        }
     }
 
     /// Run a set of tests using a Winit context.
-    pub fn run(tests: &'static [VersoBasedTest], _ctx: Context) {
-        // Create a new event loop and obtain a window target.
-        let event_loop = EventLoop::new().expect("Failed to build event loop");
-        let window = WindowBuilder::new()
-            .with_visible(false)
-            .build(&event_loop)
-            .expect("Failed to create Winit window");
-        let mut verso = Verso::new(window, event_loop.create_proxy());
+    pub fn run(tests: &'static [VersoBasedTest]) {
+        // Never show a window during tests.
+        // SAFETY: this runs before any other thread is spawned by the test harness.
+        unsafe {
+            std::env::set_var("VERSO_HEADLESS", "1");
+        }
+
+        // Watchdog: never let a hung servo instance block the run forever.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(180));
+            eprintln!("test harness timed out after 180s");
+            std::process::exit(124);
+        });
+
+        let event_loop = EventLoop::<EventLoopProxyMessage>::with_user_event()
+            .build()
+            .expect("Failed to build event loop");
+        let proxy = event_loop.create_proxy();
 
         println!("\nRunning {} tests...", tests.len());
-        let mut state = State {
-            passed: 0,
-            panics: vec![],
-            start: Instant::now(),
-            run: false,
-            code: 0,
+        let mut app = TestApp {
+            tests,
+            verso: None,
+            proxy,
+            state: State {
+                passed: 0,
+                panics: vec![],
+                start: Instant::now(),
+                run: false,
+            },
         };
 
-        // Run the tests.
         event_loop
-            .run(move |event, elwt| match verso.run(event, elwt) {
-                Status::LoadComplete => {
-                    run_internal(tests, &mut state, elwt);
-                    verso.shutdown();
-                }
-                Status::Shutdown => elwt.exit(),
-                _ => (),
-            })
+            .run_app(&mut app)
             .expect("Event loop failed to run");
+
+        if app.state.panics.is_empty() {
+            println!("test result: ok");
+        } else {
+            println!("test result: FAILED");
+            std::process::exit(1);
+        }
     }
 
     /// Run a set of tests using a Winit context.
-    fn run_internal(
-        tests: &'static [VersoBasedTest],
-        state: &mut State,
-        elwt: &EventLoopWindowTarget<()>,
-    ) {
+    fn run_internal(tests: &'static [VersoBasedTest], state: &mut State, elwt: &ActiveEventLoop) {
         if state.run {
             return;
         }
@@ -122,12 +187,12 @@ pub mod __private {
             match test.function {
                 TestFunction::OneOff(f) => match catch_unwind(AssertUnwindSafe(move || f(elwt))) {
                     Ok(()) => {
-                        println!("{}", "ok".green());
+                        println!("ok");
                         state.passed += 1;
                     }
 
                     Err(e) => {
-                        println!("{}", "FAILED".red());
+                        println!("FAILED");
                         state.panics.push((test.name, e));
                     }
                 },
@@ -142,28 +207,23 @@ pub mod __private {
                 println!("---- {} panic ----", name);
 
                 if let Some(s) = e.downcast_ref::<&'static str>() {
-                    println!("{}", s.red());
+                    println!("{}", s);
                 } else if let Some(s) = e.downcast_ref::<String>() {
-                    println!("{}", s.red());
+                    println!("{}", s);
                 } else {
-                    println!("{}", "unknown panic type".red());
+                    println!("unknown panic type");
                 }
 
                 println!();
             }
-
-            print!("test result: {}", "FAILED".red());
-        } else {
-            print!("test result: {}", "ok".green());
         }
 
-        let elapsed = state.start.elapsed();
         println!(
             ". {} passed; {} failed; finished in {:?}",
-            state.passed, failures, elapsed
+            state.passed,
+            failures,
+            state.start.elapsed()
         );
-
-        state.code = if failures == 0 { 0 } else { 1 };
     }
 
     pub struct VersoBasedTest {
@@ -172,6 +232,6 @@ pub mod __private {
     }
 
     pub enum TestFunction {
-        OneOff(fn(&EventLoopWindowTarget<()>)),
+        OneOff(fn(&ActiveEventLoop)),
     }
 }
