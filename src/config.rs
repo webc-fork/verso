@@ -1,33 +1,18 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use embedder_traits::resources::{self, Resource, ResourceReaderMethods};
-use embedder_traits::user_content_manager::UserScript as ServoUserScript;
-use headers::{ContentType, HeaderMapExt};
-use net::protocols::{ProtocolHandler, ProtocolRegistry};
-use net_traits::{
-    ResourceFetchTiming,
-    request::Request,
-    response::{Response, ResponseBody},
-};
-use servo_config::{
-    opts::{Opts, OutputOptions, initialize_options},
-    prefs::Preferences,
-};
-use versoview_messages::{ConfigFromController, CustomProtocol, UserScript};
+use dpi::{PhysicalPosition, PhysicalSize};
+use servo::OutputOptions;
+use versoview_messages::{ConfigFromController, UserScript};
 use winit::window::{Fullscreen, WindowAttributes};
 
 /// Servo time profile settings
 #[derive(Clone, Debug)]
 pub struct ProfilerSettings {
     /// Servo time profile settings
-    output_options: OutputOptions,
+    pub output_options: OutputOptions,
     /// When servo profiler is enabled, this is an optional path to dump a self-contained HTML file
     /// visualizing the traces as a timeline.
-    trace_path: Option<String>,
+    pub trace_path: Option<String>,
 }
 
 /// Command line arguments.
@@ -37,8 +22,6 @@ pub struct CliArgs {
     pub url: Option<url::Url>,
     /// The IPC channel name used to communicate with the webview controller.
     pub ipc_channel: Option<String>,
-    /// Should launch without control panel
-    pub no_panel: bool,
     /// Window size for the initial window
     pub inner_size: Option<PhysicalSize<u32>>,
     /// Window position for the initial window
@@ -62,6 +45,9 @@ pub struct CliArgs {
     pub userscripts_directory: Option<String>,
     /// Initial window's zoom level
     pub zoom_level: Option<f32>,
+    /// Show the standalone tabbed-browsing panel. Only effective when Verso
+    /// runs without an IPC controller.
+    pub with_panel: bool,
 }
 
 /// Parse CLI arguments to a [`CliArgs`]
@@ -77,7 +63,6 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         "IPC channel name to communicate and control verso",
         "",
     );
-    opts.optflag("", "no-panel", "Launch Verso without control panel");
     opts.optopt(
         "",
         "devtools-port",
@@ -108,7 +93,6 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         "Path to dump a self-contained HTML timeline of profiler traces",
         "out.html",
     );
-
     opts.optopt(
         "",
         "user-agent",
@@ -127,7 +111,6 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         "The directory to load userscripts from",
         "resources/user-agent-js/",
     );
-
     opts.optopt(
         "w",
         "width",
@@ -157,27 +140,31 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         "no-maximized",
         "Launch the initial window without maximized",
     );
-
     opts.optopt("", "zoom", "Initial window's zoom level", "1.5");
+    opts.optflag(
+        "",
+        "with-panel",
+        "Show the standalone tabbed-browsing panel (keyboard shortcuts, no controller)",
+    );
 
     let matches: getopts::Matches = opts.parse(&args[1..])?;
     let url = matches
         .opt_str("url")
-        .and_then(|url| match url::Url::parse(&url) {
-            Ok(url_parsed) => Some(url_parsed),
-            Err(e) => {
-                if e == url::ParseError::RelativeUrlWithoutBase {
-                    if let Ok(url_parsed) = url::Url::parse(&format!("https://{url}")) {
-                        return Some(url_parsed);
-                    }
+        .and_then(|raw_url| match url::Url::parse(&raw_url) {
+            Ok(url) => Some(url),
+            Err(error) => {
+                // A bare host name gets retried as an `https` URL.
+                if error == url::ParseError::RelativeUrlWithoutBase
+                    && let Ok(url) = url::Url::parse(&format!("https://{raw_url}"))
+                {
+                    return Some(url);
                 }
-                log::error!("Invalid initial url: {url}");
+                log::error!("Invalid initial url: {raw_url}");
                 None
             }
         });
     let resource_dir = matches.opt_str("resources").map(PathBuf::from);
     let ipc_channel = matches.opt_str("ipc-channel");
-    let no_panel = matches.opt_present("no-panel");
     let devtools_port = matches.opt_get::<u16>("devtools-port").unwrap_or_else(|e| {
         log::error!("Failed to parse devtools-port command line argument: {e}");
         None
@@ -251,6 +238,7 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
     };
 
     let no_maximized = matches.opt_present("no-maximized");
+    let with_panel = matches.opt_present("with-panel");
 
     let zoom_level = matches.opt_get::<f32>("zoom").unwrap_or_else(|e| {
         log::error!("Failed to parse zoom command line argument: {e}");
@@ -261,7 +249,6 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         url,
         resource_dir,
         ipc_channel,
-        no_panel,
         devtools_port,
         webdriver_port,
         profiler_settings,
@@ -272,6 +259,7 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         inner_size,
         position,
         no_maximized,
+        with_panel,
     })
 }
 
@@ -280,8 +268,6 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
 pub struct Config {
     /// URL to load initially.
     pub url: url::Url,
-    /// Should launch without or without control panel
-    pub with_panel: bool,
     /// Window settings for the initial winit window
     pub window_attributes: WindowAttributes,
     /// Port number to start a server to listen to remote Firefox devtools connections. 0 for random port.
@@ -292,15 +278,18 @@ pub struct Config {
     pub profiler_settings: Option<ProfilerSettings>,
     /// Override the user agent
     pub user_agent: String,
-    /// Script to run on document started to load
-    pub user_scripts: Vec<ServoUserScript>,
+    /// Scripts to run on document started to load
+    pub user_scripts: Vec<UserScript>,
     /// Initial window's zoom level
     pub zoom_level: Option<f32>,
     /// Path to resource directory. If None, Verso will try to get default directory. And if that
     /// still doesn't exist, all resource configuration will set to default values.
     pub resource_dir: PathBuf,
     /// Register those custom protocols
-    pub custom_protocols: Vec<CustomProtocol>,
+    pub custom_protocols: Vec<versoview_messages::CustomProtocol>,
+    /// Show the standalone tabbed-browsing panel. Only effective when Verso
+    /// runs without an IPC controller.
+    pub with_panel: bool,
 }
 
 impl Config {
@@ -308,15 +297,18 @@ impl Config {
     pub fn from_cli_args(cli_args: CliArgs) -> Self {
         let mut user_scripts = Vec::new();
         if let Some(init_script) = cli_args.init_script {
-            user_scripts.push(init_script.into());
+            user_scripts.push(UserScript {
+                script: init_script,
+                source_file: None,
+            });
         }
         user_scripts.extend(
             load_userscripts(cli_args.userscripts_directory).expect("Failed to load userscript"),
         );
-        Self::from_controller_config(ConfigFromController {
+        let mut config = Self::from_controller_config(ConfigFromController {
             url: cli_args.url,
-            with_panel: !cli_args.no_panel,
             devtools_port: cli_args.devtools_port,
+            webdriver_port: cli_args.webdriver_port,
             profiler_settings: cli_args.profiler_settings,
             user_agent: cli_args.user_agent,
             user_scripts,
@@ -325,8 +317,13 @@ impl Config {
             maximized: !cli_args.no_maximized,
             position: cli_args.position.map(Into::into),
             inner_size: cli_args.inner_size.map(Into::into),
+            // Launch without a visible window when `VERSO_HEADLESS` is set.
+            // Useful for integration tests and other automations.
+            visible: std::env::var("VERSO_HEADLESS").map_or(true, |v| v != "1"),
             ..Default::default()
-        })
+        });
+        config.with_panel = cli_args.with_panel;
+        config
     }
 
     /// Create a new configuration for creating Verso instance from the controller config.
@@ -334,7 +331,6 @@ impl Config {
         let resource_dir = config
             .resources_directory
             .unwrap_or_else(resources_dir_path);
-        let with_panel = config.with_panel;
         let user_agent = config
             .user_agent
             .unwrap_or_else(|| default_user_agent_string().to_string());
@@ -344,14 +340,18 @@ impl Config {
             .with_decorations(config.decorated)
             .with_title(config.title.unwrap_or("Verso".to_owned()))
             .with_theme(to_winit_theme(&config.theme))
-            .with_window_icon(config.icon.and_then(|icon| {
-                winit::window::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()
-            }));
-        // set min inner size
-        // should be at least able to show the whole control panel
-        // FIXME: url input has weird behavior that will expand lager when having long text
-        if with_panel {
-            window_attributes = window_attributes.with_min_inner_size(LogicalSize::new(480, 72));
+            .with_window_level(to_winit_window_level(config.window_level))
+            .with_visible(config.visible)
+            .with_maximized(config.maximized)
+            .with_fullscreen(if config.fullscreen {
+                Some(Fullscreen::Borderless(None))
+            } else {
+                None
+            });
+        if let Some(icon) = config.icon.and_then(|icon| {
+            winit::window::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()
+        }) {
+            window_attributes = window_attributes.with_window_icon(Some(icon));
         }
         if let Some(position) = config.position {
             window_attributes = window_attributes.with_position(position);
@@ -359,19 +359,15 @@ impl Config {
         if let Some(size) = config.inner_size {
             window_attributes = window_attributes.with_inner_size(size);
         }
-        window_attributes = window_attributes.with_maximized(config.maximized);
-        window_attributes = window_attributes.with_fullscreen(if config.fullscreen {
-            Some(Fullscreen::Borderless(None))
-        } else {
-            None
-        });
-        window_attributes = window_attributes.with_visible(config.visible);
-        window_attributes = window_attributes.with_active(config.focused);
-        window_attributes =
-            window_attributes.with_window_level(to_winit_window_level(config.window_level));
 
-        let profiler_settings =
-            config
+        Self {
+            url: config
+                .url
+                .unwrap_or_else(|| url::Url::parse("https://example.com").unwrap()),
+            window_attributes,
+            devtools_port: config.devtools_port,
+            webdriver_port: config.webdriver_port,
+            profiler_settings: config
                 .profiler_settings
                 .map(|profiler_settings| ProfilerSettings {
                     output_options: match profiler_settings.output_options {
@@ -383,80 +379,16 @@ impl Config {
                         }
                     },
                     trace_path: profiler_settings.trace_path,
-                });
-
-        Self {
-            url: config
-                .url
-                .unwrap_or_else(|| url::Url::parse("https://example.com").unwrap()),
-            with_panel,
-            window_attributes,
-            devtools_port: config.devtools_port,
-            webdriver_port: config.webdriver_port,
-            profiler_settings,
+                }),
             user_agent,
-            user_scripts: config
-                .user_scripts
-                .into_iter()
-                .map(|userscript| ServoUserScript {
-                    script: userscript.script,
-                    source_file: userscript.source_file,
-                })
-                .collect(),
+            user_scripts: config.user_scripts,
             zoom_level: config.zoom_level,
             resource_dir,
             custom_protocols: config.custom_protocols,
+            // The tabbed-browsing panel is standalone-only; the CLI flag is
+            // applied on top of this in `from_cli_args`.
+            with_panel: false,
         }
-    }
-
-    /// Register URL scheme protocols
-    pub fn create_protocols(&self) -> ProtocolRegistry {
-        let handler = ResourceReader(self.resource_dir.clone());
-        let mut protocols = ProtocolRegistry::with_internal_protocols();
-        protocols
-            .register("verso", handler)
-            .expect("Registering custom protocol `verso` should not fail");
-        for custom_protocol in &self.custom_protocols {
-            let scheme = &custom_protocol.scheme;
-            if let Err(error) =
-                protocols.register(scheme, CustomProtocolHandler(custom_protocol.clone()))
-            {
-                log::warn!("Registering custom protocol {scheme} failed: {error:?}");
-            }
-        }
-        protocols
-    }
-
-    /// Init options and preferences.
-    pub fn init(&self) {
-        // Set the resource files of Servo.
-        resources::set(Box::new(ResourceReader(self.resource_dir.clone())));
-
-        let mut opts = Opts::default();
-
-        if let Some(ref profiler_settings) = self.profiler_settings {
-            opts.time_profiling = Some(profiler_settings.output_options.clone());
-            opts.time_profiler_trace_path = profiler_settings.trace_path.clone();
-        }
-
-        // Set the global options of Servo.
-        initialize_options(opts);
-
-        let (devtools_server_enabled, devtools_port) =
-            if let Some(devtools_port) = self.devtools_port {
-                (true, devtools_port)
-            } else {
-                (false, 0)
-            };
-
-        // Set the preferences of Servo.
-        servo_config::prefs::set(Preferences {
-            devtools_server_enabled,
-            devtools_server_port: devtools_port as i64,
-            dom_notification_enabled: true, // experimental feature
-            user_agent: self.user_agent.clone(),
-            ..Default::default()
-        });
     }
 }
 
@@ -479,128 +411,25 @@ fn load_userscripts(
     Ok(userscripts)
 }
 
-struct ResourceReader(PathBuf);
-
-impl ResourceReaderMethods for ResourceReader {
-    fn read(&self, resource: Resource) -> Vec<u8> {
-        let path = self.0.join(resource.filename());
-        fs::read(&path).unwrap_or_else(|_| {
-            match resource {
-                // Rigppy image is the only one needs to be valid bytes.
-                // Others can be empty and Servo will set to default.
-                Resource::RippyPNG => &include_bytes!("../resources/rippy.png")[..],
-                Resource::HstsPreloadList => {
-                    log::warn!(
-                        "HSTS preload list not found, falling back to an empty list, to set this, put the list at '{}'",
-                        path.display()
-                    );
-                    // This is made out of
-                    //
-                    // ```
-                    // let mut wtr = std::io::BufWriter::new(std::fs::File::create("map.fst")?);
-                    // let mut build = fst::MapBuilder::new(wtr)?;
-                    // build.finish()?;
-                    // ```
-                    b"\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x12\x00\x00\x00\x00\x00\x00\x00Tk-\x0f"
-                }
-                _ => &[],
-            }
-            .to_vec()
-        })
-    }
-
-    fn sandbox_access_files(&self) -> Vec<PathBuf> {
-        vec![]
-    }
-
-    fn sandbox_access_files_dirs(&self) -> Vec<PathBuf> {
-        vec![]
-    }
-}
-
-impl ProtocolHandler for ResourceReader {
-    fn load(
-        &self,
-        request: &mut Request,
-        _done_chan: &mut net::fetch::methods::DoneChannel,
-        _context: &net::fetch::methods::FetchContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-        let current_url = request.current_url();
-        let path = current_url.path();
-        let path = self.0.join(path.strip_prefix('/').unwrap_or(path));
-
-        let response = if let Ok(file) = fs::read(path.clone()) {
-            let mut response = Response::new(
-                request.current_url(),
-                ResourceFetchTiming::new(request.timing_type()),
-            );
-
-            // Set Content-Type header.
-            if let Some(ext) = path.extension() {
-                match ext.to_str() {
-                    Some("css") => response
-                        .headers
-                        .typed_insert(ContentType::from(mime::TEXT_CSS)),
-                    Some("js") => response
-                        .headers
-                        .typed_insert(ContentType::from(mime::TEXT_JAVASCRIPT)),
-                    Some("json") => response.headers.typed_insert(ContentType::json()),
-                    Some("html") => response.headers.typed_insert(ContentType::html()),
-                    _ => response.headers.typed_insert(ContentType::octet_stream()),
-                }
-            }
-
-            *response.body.lock().unwrap() = ResponseBody::Done(file);
-
-            response
-        } else {
-            Response::network_internal_error("Opening file failed")
-        };
-
-        Box::pin(std::future::ready(response))
-    }
-}
-
-struct CustomProtocolHandler(CustomProtocol);
-
-impl ProtocolHandler for CustomProtocolHandler {
-    #[allow(unused_variables)]
-    fn load(
-        &self,
-        request: &mut Request,
-        done_chan: &mut net::fetch::methods::DoneChannel,
-        context: &net::fetch::methods::FetchContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>> {
-        Box::pin(std::future::ready(Response::network_internal_error(
-            "This should be handled through `on_web_resource_requested` instead",
-        )))
-    }
-
-    fn is_fetchable(&self) -> bool {
-        self.0.fetchable
-    }
-
-    fn is_secure(&self) -> bool {
-        self.0.secure
-    }
-}
-
-/// Helper function to get default resource directory if it's not provided.
+/// Get the default resource directory when the CLI doesn't provide one.
 fn resources_dir_path() -> PathBuf {
     #[cfg(feature = "packager")]
     let root_dir = {
         use cargo_packager_resource_resolver::{current_format, resources_dir};
-        current_format().and_then(|format| resources_dir(format))
+        current_format().and_then(resources_dir)
     };
     #[cfg(feature = "flatpak")]
     let root_dir = {
         use std::str::FromStr;
-        std::path::PathBuf::from_str("/app")
+        PathBuf::from_str("/app")
     };
     #[cfg(not(any(feature = "packager", feature = "flatpak")))]
     let root_dir = std::env::current_dir();
 
-    root_dir.ok().map(|dir| dir.join("resources")).unwrap()
+    root_dir
+        .ok()
+        .map(|dir| dir.join("resources"))
+        .expect("Failed to get the current directory as the resource directory root")
 }
 
 fn default_user_agent_string() -> &'static str {
@@ -621,7 +450,8 @@ fn default_user_agent_string() -> &'static str {
     UA_STRING
 }
 
-pub(crate) fn to_winit_window_level(
+/// Convert the controller's window level to winit's.
+pub fn to_winit_window_level(
     window_level: versoview_messages::WindowLevel,
 ) -> winit::window::WindowLevel {
     match window_level {
@@ -633,9 +463,8 @@ pub(crate) fn to_winit_window_level(
     }
 }
 
-pub(crate) fn to_winit_theme(
-    theme: &Option<versoview_messages::Theme>,
-) -> Option<winit::window::Theme> {
+/// Convert the controller's theme preference to winit's (`None` = follow system).
+pub fn to_winit_theme(theme: &Option<versoview_messages::Theme>) -> Option<winit::window::Theme> {
     match theme {
         Some(versoview_messages::Theme::Light) => Some(winit::window::Theme::Light),
         Some(versoview_messages::Theme::Dark) => Some(winit::window::Theme::Dark),

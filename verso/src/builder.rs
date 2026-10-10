@@ -1,13 +1,19 @@
-use crate::{CustomProtocol, ProfilerSettings, UserScript};
-use dpi::{Position, Size};
 use std::path::{Path, PathBuf};
+
+use dpi::{Position, Size};
 use versoview_messages::ConfigFromController;
 
-use crate::VersoviewController;
+use crate::{CustomProtocol, ProfilerSettings, UserScript, VersoviewController};
 
 /// A builder for configuring and creating a [`VersoviewController`] instance.
 #[derive(Debug, Clone)]
 pub struct VersoBuilder(ConfigFromController);
+
+impl Default for VersoBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl VersoBuilder {
     /// Creates a new [`VersoBuilder`] with default settings.
@@ -152,6 +158,8 @@ impl VersoBuilder {
     /// ## Example
     ///
     /// ```
+    /// use verso::{CustomProtocolBuilder, VersoBuilder};
+    ///
     /// let verso_builder =
     ///     VersoBuilder::new().custom_protocol(CustomProtocolBuilder::new("custom-protocol-1"));
     /// ```
@@ -165,6 +173,8 @@ impl VersoBuilder {
     /// ## Example
     ///
     /// ```
+    /// use verso::{CustomProtocolBuilder, VersoBuilder};
+    ///
     /// let verso_builder = VersoBuilder::new().custom_protocols([
     ///     CustomProtocolBuilder::new("custom-protocol-1"),
     ///     CustomProtocolBuilder::new("custom-protocol-2"),

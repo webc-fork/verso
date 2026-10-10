@@ -1,18 +1,20 @@
 mod builder;
-pub use builder::VersoBuilder;
+use std::{
+    collections::HashMap,
+    path::Path,
+    process::{Child, Command},
+    sync::{Arc, Mutex, mpsc::Sender as MpscSender},
+    thread,
+    time::{Duration, Instant},
+};
 
+pub use builder::VersoBuilder;
 use dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use ipc_channel::{
     ipc::{IpcOneShotServer, IpcSender},
     router::ROUTER,
 };
 use log::error;
-use std::{
-    collections::HashMap,
-    path::Path,
-    process::Command,
-    sync::{Arc, Mutex, mpsc::Sender as MpscSender},
-};
 pub use versoview_messages::{
     ConfigFromController as VersoviewSettings, CustomProtocol, CustomProtocolBuilder, Icon,
     ProfilerSettings, Theme, UserScript, WindowLevel,
@@ -24,13 +26,20 @@ use versoview_messages::{
 type ResponseFunction = Box<dyn FnOnce(Option<http::Response<Vec<u8>>>) + Send>;
 type Listener<T> = Arc<Mutex<Option<T>>>;
 type ResponseListener<T> = Arc<Mutex<HashMap<uuid::Uuid, MpscSender<T>>>>;
+type CloseRequestedHandler = Box<dyn Fn() + Send + 'static>;
+type NavigationStartingHandler = Box<dyn Fn(url::Url) -> bool + Send + 'static>;
+type WebResourceRequestedHandler =
+    Box<dyn Fn(http::Request<Vec<u8>>, ResponseFunction) + Send + 'static>;
+
+/// How long a [`VersoviewController`] waits for versoview to exit on its own after
+/// sending it the exit message, before killing it.
+const EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct EventListeners {
-    on_close_requested: Listener<Box<dyn Fn() + Send + 'static>>,
-    on_navigation_starting: Listener<Box<dyn Fn(url::Url) -> bool + Send + 'static>>,
-    on_web_resource_requested:
-        Listener<Box<dyn Fn(http::Request<Vec<u8>>, ResponseFunction) + Send + 'static>>,
+    on_close_requested: Listener<CloseRequestedHandler>,
+    on_navigation_starting: Listener<NavigationStartingHandler>,
+    on_web_resource_requested: Listener<WebResourceRequestedHandler>,
     title_response: ResponseListener<String>,
     size_response: ResponseListener<PhysicalSize<u32>>,
     position_response: ResponseListener<Option<PhysicalPosition<i32>>>,
@@ -48,7 +57,19 @@ struct EventListeners {
 /// Send an exit signal to this Verso instance when dropped
 pub struct VersoviewController {
     sender: IpcSender<ToVersoMessage>,
+    /// The versoview process spawned by [`Self::create`], reaped on drop.
+    child: Mutex<Option<Child>>,
     event_listeners: EventListeners,
+}
+
+/// Send a `Get*` response to the caller waiting on `id`, if any, and forget that request id.
+fn respond<T>(listeners: &ResponseListener<T>, id: uuid::Uuid, response: T) {
+    let Some(sender) = listeners.lock().unwrap().remove(&id) else {
+        return;
+    };
+    if let Err(error) = sender.send(response) {
+        error!("Failed to send the response of the request {id}: {error}");
+    }
 }
 
 impl VersoviewController {
@@ -58,23 +79,25 @@ impl VersoviewController {
         initial_url: url::Url,
         mut settings: VersoviewSettings,
     ) -> Self {
-        let path = verso_path.as_ref();
-        let (server, server_name) = IpcOneShotServer::<ToControllerMessage>::new().unwrap();
-        Command::new(path)
+        let (server, server_name) = IpcOneShotServer::<ToControllerMessage>::new()
+            .expect("Failed to create the IPC server for the versoview connection");
+        let child = Command::new(verso_path.as_ref())
             .arg(format!("--ipc-channel={server_name}"))
             .spawn()
-            .unwrap();
+            .expect("Failed to spawn the versoview process");
 
-        let (receiver, message) = server.accept().unwrap();
+        let (receiver, message) = server
+            .accept()
+            .expect("Failed to accept the connection from versoview");
         let ToControllerMessage::SetToVersoSender(sender) = message else {
             panic!(
                 "The initial message sent from versoview is not a `ToControllerMessage::SetToVersoSender`"
             )
         };
 
-        settings.url.replace(initial_url);
+        settings.url = Some(initial_url);
         sender
-            .send(ToVersoMessage::SetConfig(settings))
+            .send(ToVersoMessage::SetConfig(Box::new(settings)))
             .expect("Failed to send initial settings to versoview");
 
         let event_listeners = EventListeners::default();
@@ -93,100 +116,77 @@ impl VersoviewController {
         let get_url_response = event_listeners.get_url_response.clone();
         let to_verso_sender = sender.clone();
         ROUTER.add_typed_route(
-            receiver,
-            Box::new(move |message| match message {
-                Ok(message) => match message {
-                    ToControllerMessage::OnCloseRequested => {
-                        if let Some(ref callback) = *on_close_requested.lock().unwrap() {
-                            callback();
-                        }
-                    }
-                    ToControllerMessage::OnNavigationStarting(id, url) => {
-                        if let Some(ref callback) = *on_navigation_starting.lock().unwrap() {
-                            if let Err(error) = to_verso_sender.send(
-                                ToVersoMessage::OnNavigationStartingResponse(id, callback(url)),
-                            ) {
-                                error!(
-                                    "Error while sending back OnNavigationStarting result: {error}"
-                                );
-                            }
-                        }
-                    }
-                    ToControllerMessage::OnWebResourceRequested(request) => {
-                        if let Some(ref callback) = *on_web_resource_requested.lock().unwrap() {
-                            let sender_clone = to_verso_sender.clone();
-                            let id = request.id;
-                            callback(
-                                request.request,
-                                Box::new(move |response| {
-                                    if let Err(error) = sender_clone.send(ToVersoMessage::WebResourceRequestResponse(
-                                        WebResourceRequestResponse { id, response },
-                                    )) {
-                                        error!("Error while sending back OnNavigationStarting result: {error}");
-                                    }
-                                }),
-                            );
-                        }
-                    }
-                    ToControllerMessage::GetTitleResponse(id, title) => {
-                        if let Some(sender) = title_response.lock().unwrap().get(&id).take() {
-                            sender.send(title).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetSizeResponse(id, size) => {
-                        if let Some(sender) = size_response.lock().unwrap().get(&id).take() {
-                            sender.send(size).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetPositionResponse(id, position) => {
-                        if let Some(sender) = position_response.lock().unwrap().get(&id).take() {
-                            sender.send(position).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetMaximizedResponse(id, maximized) => {
-                        if let Some(sender) = maximized_response.lock().unwrap().get(&id).take() {
-                            sender.send(maximized).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetMinimizedResponse(id, minimized) => {
-                        if let Some(sender) = minimized_response.lock().unwrap().get(&id).take() {
-                            sender.send(minimized).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetFullscreenResponse(id, fullscreen) => {
-                        if let Some(sender) = fullscreen_response.lock().unwrap().get(&id).take() {
-                            sender.send(fullscreen).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetVisibleResponse(id, visible) => {
-                        if let Some(sender) = visible_response.lock().unwrap().get(&id).take() {
-                            sender.send(visible).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetScaleFactorResponse(id, scale_factor) => {
-                        if let Some(sender) = scale_factor_response.lock().unwrap().get(&id).take() {
-                            sender.send(scale_factor).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetThemeResponse(id, theme) => {
-                        if let Some(sender) = theme_response.lock().unwrap().get(&id).take() {
-                            sender.send(theme).unwrap();
-                        }
-                    }
-                    ToControllerMessage::GetCurrentUrlResponse(id, url) => {
-                        if let Some(sender) = get_url_response.lock().unwrap().get(&id).take() {
-                            sender.send(url).unwrap();
-                        }
-                    }
-                    ToControllerMessage::SetToVersoSender(..) => {
-                        log::error!("`ToControllerMessage::SetToVersoSender` should not be received after the initial setup")
-                    }
-                },
-                Err(e) => error!("Error while receiving VersoMessage: {e}"),
-            }),
-        );
+      receiver,
+      Box::new(move |message| match message {
+        Ok(message) => match message {
+          ToControllerMessage::OnCloseRequested => {
+            if let Some(callback) = on_close_requested.lock().unwrap().as_ref() {
+              callback();
+            }
+          }
+          ToControllerMessage::OnNavigationStarting(id, url) => {
+            if let Some(callback) = on_navigation_starting.lock().unwrap().as_ref() {
+              let allow = callback(url);
+              if let Err(error) =
+                to_verso_sender.send(ToVersoMessage::OnNavigationStartingResponse(id, allow))
+              {
+                error!("Error while sending back the OnNavigationStarting result: {error}");
+              }
+            }
+          }
+          ToControllerMessage::OnWebResourceRequested(request) => {
+            if let Some(callback) = on_web_resource_requested.lock().unwrap().as_ref() {
+              let to_verso_sender = to_verso_sender.clone();
+              let id = request.id;
+              callback(
+                request.request,
+                Box::new(move |response| {
+                  let message =
+                    ToVersoMessage::WebResourceRequestResponse(WebResourceRequestResponse {
+                      id,
+                      response,
+                    });
+                  if let Err(error) = to_verso_sender.send(message) {
+                    error!("Error while sending back the OnWebResourceRequested result: {error}");
+                  }
+                }),
+              );
+            }
+          }
+          ToControllerMessage::GetTitleResponse(id, title) => respond(&title_response, id, title),
+          ToControllerMessage::GetSizeResponse(id, size) => respond(&size_response, id, size),
+          ToControllerMessage::GetPositionResponse(id, position) => {
+            respond(&position_response, id, position);
+          }
+          ToControllerMessage::GetMaximizedResponse(id, maximized) => {
+            respond(&maximized_response, id, maximized);
+          }
+          ToControllerMessage::GetMinimizedResponse(id, minimized) => {
+            respond(&minimized_response, id, minimized);
+          }
+          ToControllerMessage::GetFullscreenResponse(id, fullscreen) => {
+            respond(&fullscreen_response, id, fullscreen);
+          }
+          ToControllerMessage::GetVisibleResponse(id, visible) => {
+            respond(&visible_response, id, visible);
+          }
+          ToControllerMessage::GetScaleFactorResponse(id, scale_factor) => {
+            respond(&scale_factor_response, id, scale_factor);
+          }
+          ToControllerMessage::GetThemeResponse(id, theme) => respond(&theme_response, id, theme),
+          ToControllerMessage::GetCurrentUrlResponse(id, url) => {
+            respond(&get_url_response, id, url);
+          }
+          ToControllerMessage::SetToVersoSender(..) => error!(
+            "`ToControllerMessage::SetToVersoSender` should not be received after the initial setup"
+          ),
+        },
+        Err(error) => error!("Error while receiving VersoMessage: {error}"),
+      }),
+    );
         Self {
             sender,
+            child: Mutex::new(Some(child)),
             event_listeners,
         }
     }
@@ -197,7 +197,7 @@ impl VersoviewController {
     }
 
     /// Exit
-    pub fn exit(&self) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn exit(&self) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::Exit)
     }
 
@@ -207,7 +207,7 @@ impl VersoviewController {
     pub fn on_close_requested(
         &self,
         callback: impl Fn() + Send + 'static,
-    ) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    ) -> Result<(), ipc_channel::IpcError> {
         let old_listener = self
             .event_listeners
             .on_close_requested
@@ -221,21 +221,18 @@ impl VersoviewController {
     }
 
     /// Execute script
-    pub fn execute_script<S: Into<String>>(
-        &self,
-        script: S,
-    ) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn execute_script<S: Into<String>>(&self, script: S) -> Result<(), ipc_channel::IpcError> {
         self.sender
             .send(ToVersoMessage::ExecuteScript(script.into()))
     }
 
     /// Navigate to url
-    pub fn navigate(&self, url: url::Url) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn navigate(&self, url: url::Url) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::NavigateTo(url))
     }
 
     /// Reload the current webview
-    pub fn reload(&self) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn reload(&self) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::Reload)
     }
 
@@ -244,7 +241,7 @@ impl VersoviewController {
     pub fn on_navigation_starting(
         &self,
         callback: impl Fn(url::Url) -> bool + Send + 'static,
-    ) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    ) -> Result<(), ipc_channel::IpcError> {
         let old_listener = self
             .event_listeners
             .on_navigation_starting
@@ -271,7 +268,7 @@ impl VersoviewController {
     ///
     /// ## Examples
     ///
-    /// ```
+    /// ```no_run
     /// let controller = verso::VersoBuilder::new()
     ///     .build("versoview", url::Url::parse("https://example.com/").unwrap());
     /// controller
@@ -291,7 +288,7 @@ impl VersoviewController {
     pub fn on_web_resource_requested(
         &self,
         callback: impl Fn(http::Request<Vec<u8>>, ResponseFunction) + Send + 'static,
-    ) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    ) -> Result<(), ipc_channel::IpcError> {
         let old_listener = self
             .event_listeners
             .on_web_resource_requested
@@ -306,13 +303,13 @@ impl VersoviewController {
     }
 
     /// Sets the window title
-    pub fn set_title<S: Into<String>>(&self, title: S) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_title<S: Into<String>>(&self, title: S) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::SetTitle(title.into()))?;
         Ok(())
     }
 
     /// Sets the webview window's size
-    pub fn set_size<S: Into<Size>>(&self, size: S) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_size<S: Into<Size>>(&self, size: S) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::SetSize(size.into()))?;
         Ok(())
     }
@@ -321,77 +318,71 @@ impl VersoviewController {
     pub fn set_position<P: Into<Position>>(
         &self,
         position: P,
-    ) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    ) -> Result<(), ipc_channel::IpcError> {
         self.sender
             .send(ToVersoMessage::SetPosition(position.into()))?;
         Ok(())
     }
 
     /// Maximize or unmaximize the window
-    pub fn set_maximized(&self, maximized: bool) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_maximized(&self, maximized: bool) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::SetMaximized(maximized))?;
         Ok(())
     }
 
     /// Minimize or unminimize the window
-    pub fn set_minimized(&self, minimized: bool) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_minimized(&self, minimized: bool) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::SetMinimized(minimized))?;
         Ok(())
     }
 
     /// Sets the window to fullscreen or back
-    pub fn set_fullscreen(&self, fullscreen: bool) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_fullscreen(&self, fullscreen: bool) -> Result<(), ipc_channel::IpcError> {
         self.sender
             .send(ToVersoMessage::SetFullscreen(fullscreen))?;
         Ok(())
     }
 
     /// Show or hide the window
-    pub fn set_visible(&self, visible: bool) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_visible(&self, visible: bool) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::SetVisible(visible))?;
         Ok(())
     }
 
     /// Change the window level
-    pub fn set_window_level(
-        &self,
-        window_level: WindowLevel,
-    ) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_window_level(&self, window_level: WindowLevel) -> Result<(), ipc_channel::IpcError> {
         self.sender
             .send(ToVersoMessage::SetWindowLevel(window_level))?;
         Ok(())
     }
 
     /// Sets the theme
-    pub fn set_theme(&self, theme: Option<Theme>) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn set_theme(&self, theme: Option<Theme>) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::SetTheme(theme))?;
         Ok(())
     }
 
     /// Moves the window with the left mouse button until the button is released
-    pub fn start_dragging(&self) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn start_dragging(&self) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::StartDragging)?;
         Ok(())
     }
 
     /// Bring the window to the front, and capture input focus
-    pub fn focus(&self) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    pub fn focus(&self) -> Result<(), ipc_channel::IpcError> {
         self.sender.send(ToVersoMessage::Focus)?;
         Ok(())
     }
 
     /// Get the title of the window
-    pub fn get_title(&self) -> Result<String, Box<ipc_channel::ErrorKind>> {
+    pub fn get_title(&self) -> Result<String, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.title_response, |id| {
             ToVersoMessage::GetTitle(id)
         })
     }
 
     /// Get the window's size
-    fn get_size(
-        &self,
-        size_type: SizeType,
-    ) -> Result<PhysicalSize<u32>, Box<ipc_channel::ErrorKind>> {
+    fn get_size(&self, size_type: SizeType) -> Result<PhysicalSize<u32>, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.size_response, |id| {
             ToVersoMessage::GetSize(id, size_type)
         })
@@ -400,7 +391,7 @@ impl VersoviewController {
     /// Returns the physical size of the window's client area.
     ///
     /// The client area is the content of the window, excluding the title bar and borders.
-    pub fn get_inner_size(&self) -> Result<PhysicalSize<u32>, Box<ipc_channel::ErrorKind>> {
+    pub fn get_inner_size(&self) -> Result<PhysicalSize<u32>, ipc_channel::IpcError> {
         self.get_size(SizeType::Inner)
     }
 
@@ -408,7 +399,7 @@ impl VersoviewController {
     ///
     /// These dimensions include the title bar and borders.
     /// If you don't want that (and you usually don't), use [`Self::get_inner_size`] instead.
-    pub fn get_outer_size(&self) -> Result<PhysicalSize<u32>, Box<ipc_channel::ErrorKind>> {
+    pub fn get_outer_size(&self) -> Result<PhysicalSize<u32>, ipc_channel::IpcError> {
         self.get_size(SizeType::Outer)
     }
 
@@ -417,7 +408,7 @@ impl VersoviewController {
     fn get_position(
         &self,
         position_type: PositionType,
-    ) -> Result<Option<PhysicalPosition<i32>>, Box<ipc_channel::ErrorKind>> {
+    ) -> Result<Option<PhysicalPosition<i32>>, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.position_response, |id| {
             ToVersoMessage::GetPosition(id, position_type)
         })
@@ -427,7 +418,7 @@ impl VersoviewController {
     /// returns [`None`] on unsupported platforms (currently only Wayland)
     pub fn get_inner_position(
         &self,
-    ) -> Result<Option<PhysicalPosition<i32>>, Box<ipc_channel::ErrorKind>> {
+    ) -> Result<Option<PhysicalPosition<i32>>, ipc_channel::IpcError> {
         self.get_position(PositionType::Inner)
     }
 
@@ -435,54 +426,54 @@ impl VersoviewController {
     /// returns [`None`] on unsupported platforms (currently only Wayland)
     pub fn get_outer_position(
         &self,
-    ) -> Result<Option<PhysicalPosition<i32>>, Box<ipc_channel::ErrorKind>> {
+    ) -> Result<Option<PhysicalPosition<i32>>, ipc_channel::IpcError> {
         self.get_position(PositionType::Outer)
     }
 
     /// Get if the window is currently maximized or not
-    pub fn is_maximized(&self) -> Result<bool, Box<ipc_channel::ErrorKind>> {
+    pub fn is_maximized(&self) -> Result<bool, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.maximized_response, |id| {
             ToVersoMessage::GetMaximized(id)
         })
     }
 
     /// Get if the window is currently minimized or not
-    pub fn is_minimized(&self) -> Result<bool, Box<ipc_channel::ErrorKind>> {
+    pub fn is_minimized(&self) -> Result<bool, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.minimized_response, |id| {
             ToVersoMessage::GetMinimized(id)
         })
     }
 
     /// Get if the window is currently fullscreen or not
-    pub fn is_fullscreen(&self) -> Result<bool, Box<ipc_channel::ErrorKind>> {
+    pub fn is_fullscreen(&self) -> Result<bool, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.fullscreen_response, |id| {
             ToVersoMessage::GetFullscreen(id)
         })
     }
 
     /// Get the visibility of the window
-    pub fn is_visible(&self) -> Result<bool, Box<ipc_channel::ErrorKind>> {
+    pub fn is_visible(&self) -> Result<bool, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.visible_response, |id| {
             ToVersoMessage::GetVisible(id)
         })
     }
 
     /// Get the scale factor of the window
-    pub fn get_scale_factor(&self) -> Result<f64, Box<ipc_channel::ErrorKind>> {
+    pub fn get_scale_factor(&self) -> Result<f64, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.scale_factor_response, |id| {
             ToVersoMessage::GetScaleFactor(id)
         })
     }
 
     /// Get the current theme of the window
-    pub fn get_theme(&self) -> Result<Theme, Box<ipc_channel::ErrorKind>> {
+    pub fn get_theme(&self) -> Result<Theme, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.theme_response, |id| {
             ToVersoMessage::GetTheme(id)
         })
     }
 
     /// Get the URL of the webview
-    pub fn get_current_url(&self) -> Result<url::Url, Box<ipc_channel::ErrorKind>> {
+    pub fn get_current_url(&self) -> Result<url::Url, ipc_channel::IpcError> {
         self.get_response(&self.event_listeners.get_url_response, |id| {
             ToVersoMessage::GetCurrentUrl(id)
         })
@@ -494,7 +485,7 @@ impl VersoviewController {
         &self,
         listener: &ResponseListener<T>,
         message: impl FnOnce(uuid::Uuid) -> ToVersoMessage,
-    ) -> Result<T, Box<ipc_channel::ErrorKind>> {
+    ) -> Result<T, ipc_channel::IpcError> {
         let id = uuid::Uuid::new_v4();
         let (sender, receiver) = std::sync::mpsc::channel();
         listener.lock().unwrap().insert(id, sender);
@@ -506,14 +497,27 @@ impl VersoviewController {
     }
 
     // /// Add init script to run on document started to load
-    // pub fn add_init_script(&self, script: String) -> Result<(), Box<ipc_channel::ErrorKind>> {
+    // pub fn add_init_script(&self, script: String) -> Result<(), ipc_channel::IpcError> {
     //     self.sender.send(ToVersoMessage::AddInitScript(script))
     // }
 }
 
 impl Drop for VersoviewController {
-    /// Send an exit signal to this Verso instance
+    /// Send an exit signal to this Verso instance and reap it
     fn drop(&mut self) {
         let _ = self.exit();
+        let Some(mut child) = self.child.lock().unwrap().take() else {
+            return;
+        };
+        let deadline = Instant::now() + EXIT_GRACE_PERIOD;
+        while child.try_wait().ok().flatten().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Waiting reaps the process so that it never lingers as a zombie.
+        let _ = child.wait();
     }
 }

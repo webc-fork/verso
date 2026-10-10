@@ -2,7 +2,7 @@ with import <nixpkgs> { };
 let
   nixgl = import (fetchTarball "https://github.com/nix-community/nixGL/archive/489d6b095ab9d289fe11af0219a9ff00fe87c7c5.tar.gz") { enable32bits = false; };
   pkgs_gnumake_4_3 = import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/6adf48f53d819a7b6e15672817fa1e78e5f4e84f.tar.gz") { };
-  llvmPackages = llvmPackages_14; # servo/servo#31059
+  llvmPackages = llvmPackages_18; # modern llvm/clang for servo 0.7
   stdenv = stdenvAdapters.useMoldLinker llvmPackages.stdenv;
 in
 stdenv.mkDerivation {
@@ -30,7 +30,6 @@ stdenv.mkDerivation {
     git
     pkg-config
     which
-    llvm
     perl
     yasm
     m4
@@ -39,6 +38,7 @@ stdenv.mkDerivation {
     mold
     wayland
     nixgl.auto.nixGLDefault
+    uv
     (python3.withPackages (ps: with ps; [pip dbus]))
   ];
   LD_LIBRARY_PATH = lib.makeLibraryPath [

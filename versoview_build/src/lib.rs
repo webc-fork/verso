@@ -7,9 +7,7 @@
 //! To use it, first add it to your build dependency, and in your build script:
 //!
 //! ```no_run
-//! fn main() {
-//!     versoview_build::download_and_extract_verso("output_directory").unwrap();
-//! }
+//! versoview_build::download_and_extract_verso("output_directory").unwrap();
 //! ```
 
 use std::{

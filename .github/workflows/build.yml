@@ -24,39 +24,30 @@ jobs:
   pr-fast-check:
     if: ${{ github.event_name == 'pull_request' }}
     name: Pull Request Fast Check
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
-      - name: Install Rust
-        uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Set env
-        run: echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
 
-      - name: Install dependencies
+      - uses: nixbuild/nix-quick-install-action@v30
+
+      - name: "Add Nix channel"
         run: |
-          sudo apt-get update
-          sudo apt install build-essential python3-pip ccache clang cmake curl \
-            g++ git gperf libdbus-1-dev libfreetype6-dev libgl1-mesa-dri \
-            libgles2-mesa-dev libglib2.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-good libgstreamer-plugins-good1.0-dev \
-            gstreamer1.0-plugins-bad libgstreamer-plugins-bad1.0-dev \
-            gstreamer1.0-plugins-ugly gstreamer1.0-plugins-base \
-            libgstreamer-plugins-base1.0-dev gstreamer1.0-libav \
-            libgstrtspserver-1.0-dev gstreamer1.0-tools libges-1.0-dev \
-            libharfbuzz-dev liblzma-dev libunwind-dev libvulkan1 \
-            libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxmu-dev libxmu6 libegl1-mesa-dev llvm-dev m4 xorg-dev sway \
+          nix-channel --add https://nixos.org/channels/nixos-24.11 nixpkgs
+          nix-channel --update nixpkgs
 
       - name: Check
-        run: cargo check
+        run: nix-shell shell.nix --run 'cargo check'
 
   build-linux:
     if: ${{ github.event_name != 'pull_request' }}
     name: Build [Linux]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
       CCACHE: sccache
@@ -68,7 +59,7 @@ jobs:
       XDG_SESSION_TYPE: wayland
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dsherret/rust-toolchain-file@v1
@@ -84,32 +75,31 @@ jobs:
           sudo flatpak install -y --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//24.08
           sudo flatpak install -y --noninteractive flathub org.freedesktop.Sdk.Extension.llvm18//24.08
 
-      - name: Set env
-        run: echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
-
       - name: Run sccache-cache
         uses: Mozilla-Actions/sccache-action@v0.0.4
 
-      - name: Install dependencies for merge group test
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install Nix for merge group test
+        if: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+        uses: nixbuild/nix-quick-install-action@v30
+
+      - name: "Add Nix channel"
         if: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
         run: |
-          sudo apt-get update
-          sudo apt install build-essential python3-pip ccache clang cmake curl \
-            g++ git gperf libdbus-1-dev libfreetype6-dev libgl1-mesa-dri \
-            libgles2-mesa-dev libglib2.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-good libgstreamer-plugins-good1.0-dev \
-            gstreamer1.0-plugins-bad libgstreamer-plugins-bad1.0-dev \
-            gstreamer1.0-plugins-ugly gstreamer1.0-plugins-base \
-            libgstreamer-plugins-base1.0-dev gstreamer1.0-libav \
-            libgstrtspserver-1.0-dev gstreamer1.0-tools libges-1.0-dev \
-            libharfbuzz-dev liblzma-dev libunwind-dev libunwind-dev libvulkan1 \
-            libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxmu-dev libxmu6 libegl1-mesa-dev llvm-dev m4 xorg-dev sway \
+          nix-channel --add https://nixos.org/channels/nixos-24.11 nixpkgs
+          nix-channel --update nixpkgs
 
       - name: Check for merge group test
         if: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
         run: |
-          cargo check
+          nix-shell shell.nix --run 'cargo check'
 
       # - name: Test
       #   # Run sway(wayland compositor) in the background, winit will use it
@@ -148,19 +138,23 @@ jobs:
     name: Build [Windows]
     runs-on: windows-latest
     env:
+      CFLAGS: /std:c11
       CCACHE: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dsherret/rust-toolchain-file@v1
 
       - name: Install Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
 
       - name: Install scroop
         uses: MinoruSekine/setup-scoop@v3
@@ -169,9 +163,11 @@ jobs:
         run: |
           scoop install git cmake curl
 
-      - name: Upgrade LLVM
-        run: |
-          choco upgrade llvm
+      # Mozangle needs Clang 19+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20"
 
       - name: Run sccache-cache
         uses: Mozilla-Actions/sccache-action@v0.0.4
@@ -221,15 +217,18 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dsherret/rust-toolchain-file@v1
 
       - name: Install Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
 
       - name: Install dependencies
         run: |

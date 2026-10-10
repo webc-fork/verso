@@ -16,7 +16,9 @@ type SerializedPipelineId = Vec<u8>;
 pub enum ToVersoMessage {
     /// Initial configs for versoview
     /// this will be the first message sent to Verso once we received the sender from [`ToControllerMessage::SetToVersoSender`]
-    SetConfig(ConfigFromController),
+    ///
+    /// Boxed because [`ConfigFromController`] is much larger than the other variants' payloads.
+    SetConfig(Box<ConfigFromController>),
     /// Exit
     Exit,
     /// Register a listener on versoview for getting notified on close requested from the OS,

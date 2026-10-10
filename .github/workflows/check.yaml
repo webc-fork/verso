@@ -25,39 +25,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt install build-essential python3-pip ccache clang cmake curl \
-            g++ git gperf libdbus-1-dev libfreetype6-dev libgl1-mesa-dri \
-            libgles2-mesa-dev libglib2.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-good libgstreamer-plugins-good1.0-dev \
-            gstreamer1.0-plugins-bad libgstreamer-plugins-bad1.0-dev \
-            gstreamer1.0-plugins-ugly gstreamer1.0-plugins-base \
-            libgstreamer-plugins-base1.0-dev gstreamer1.0-libav \
-            libgstrtspserver-1.0-dev gstreamer1.0-tools libges-1.0-dev \
-            libharfbuzz-dev liblzma-dev libunwind-dev libvulkan1 \
-            libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxmu-dev libxmu6 libegl1-mesa-dev llvm-dev libclang-dev m4 xorg-dev sway \
-
-      # https://github.com/servo/servo/blob/a0730d7154e183a9b2d9a9282061e6c67d87a263/.github/workflows/linux.yml#L141
-      - name: Set LIBCLANG_PATH # This is needed for bindgen in mozangle.
-        run: echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> $GITHUB_ENV
-
-      - name: Install Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.0
 
-      # Clippy is not part of the minimal toolchain profile in rust-toolchain.toml
-      - name: Add clippy component
-        run: rustup component add clippy
+      - uses: nixbuild/nix-quick-install-action@v30
+
+      - name: "Add Nix channel"
+        run: |
+          nix-channel --add https://nixos.org/channels/nixos-24.11 nixpkgs
+          nix-channel --update nixpkgs
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: nix-shell shell.nix --run 'rustup component add clippy && cargo clippy --workspace --all-targets -- -D warnings'
 
   check-windows:
     runs-on: windows-latest
