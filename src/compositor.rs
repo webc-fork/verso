@@ -1299,6 +1299,21 @@ impl IOCompositor {
             _ => unreachable!("Unexpected input event type: {event:?}"),
         }
 
+        // If the event is a mouse button press, ask the constellation to focus the
+        // webview under the point. The constellation replies with
+        // `EmbedderMsg::WebViewFocused`, which updates the focused webview id so
+        // that keyboard and IME events follow the mouse click.
+        if let InputEvent::MouseButton(event) = &event {
+            if event.action == MouseButtonAction::Down {
+                if let Err(error) = self
+                    .constellation_sender
+                    .send(EmbedderToConstellationMessage::FocusWebView(webview_id))
+                {
+                    warn!("Sending FocusWebView to constellation failed ({error:?}).");
+                }
+            }
+        }
+
         if let Err(error) =
             self.constellation_sender
                 .send(EmbedderToConstellationMessage::ForwardInputEvent(
@@ -1329,6 +1344,15 @@ impl IOCompositor {
 
     fn hit_test_at_point(&self, point: DevicePoint) -> Vec<CompositorHitTestResult> {
         self.hit_test_at_point_with_flags(point, HitTestFlags::empty())
+    }
+
+    /// Get the webview id from a point.
+    pub(crate) fn webview_id_from_point(&self, point: DevicePoint) -> Option<WebViewId> {
+        let result = self.hit_test_at_point(point).into_iter().next()?;
+        self.pipeline_details
+            .get(&result.pipeline_id)
+            .and_then(|details| details.pipeline.as_ref())
+            .map(|pipeline| pipeline.webview_id)
     }
 
     fn hit_test_at_point_with_flags(

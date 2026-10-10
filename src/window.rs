@@ -506,12 +506,9 @@ impl Window {
 
                 /* handle mouse events */
 
-                let webview_id = match self.focused_webview_id {
-                    Some(webview_id) => webview_id,
-                    None => {
-                        log::trace!("No focused webview, skipping MouseInput event.");
-                        return;
-                    }
+                let Some(webview_id) = compositor.webview_id_from_point(point) else {
+                    log::trace!("No webview at point, skipping MouseInput event.");
+                    return;
                 };
 
                 let button: MouseButton = match button {
