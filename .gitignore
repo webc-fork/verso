@@ -5,7 +5,7 @@ Cargo.lock
 .flatpak-builder/
 libmozjs*
 cargo-sources.json
-
+node_modules/
 resources/*
 !resources/components/
 !resources/prefs.json

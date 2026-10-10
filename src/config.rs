@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use dpi::{PhysicalPosition, PhysicalSize};
+use dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use servo::OutputOptions;
 use versoview_messages::{ConfigFromController, UserScript};
 use winit::window::{Fullscreen, WindowAttributes};
@@ -143,8 +143,13 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
     opts.optopt("", "zoom", "Initial window's zoom level", "1.5");
     opts.optflag(
         "",
+        "no-panel",
+        "Launch Verso without control panel",
+    );
+    opts.optflag(
+        "",
         "with-panel",
-        "Show the standalone tabbed-browsing panel (keyboard shortcuts, no controller)",
+        "Show the standalone tabbed-browsing panel",
     );
 
     let matches: getopts::Matches = opts.parse(&args[1..])?;
@@ -238,7 +243,8 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
     };
 
     let no_maximized = matches.opt_present("no-maximized");
-    let with_panel = matches.opt_present("with-panel");
+    let no_panel = matches.opt_present("no-panel");
+    let with_panel = !no_panel;
 
     let zoom_level = matches.opt_get::<f32>("zoom").unwrap_or_else(|e| {
         log::error!("Failed to parse zoom command line argument: {e}");
@@ -358,6 +364,11 @@ impl Config {
         }
         if let Some(size) = config.inner_size {
             window_attributes = window_attributes.with_inner_size(size);
+        } else {
+            window_attributes = window_attributes.with_inner_size(LogicalSize::new(1024, 768));
+        }
+        if config.with_panel {
+            window_attributes = window_attributes.with_min_inner_size(LogicalSize::new(480, 150));
         }
 
         Self {

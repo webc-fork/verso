@@ -81,7 +81,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 thiserror = "2"
 uuid.workspace = true
 # Packager feature
-cargo-packager-resource-resolver = { version = "0.1.1", features = [
+cargo-packager-resource-resolver = { version = "0.1.2", features = [
   "auto-detect-format",
 ], optional = true }
 
