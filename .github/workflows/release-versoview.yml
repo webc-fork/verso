@@ -10,16 +10,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # x86_64 is built natively on the x64 runner;
+  # aarch64 is built natively on the free arm64 runner.
+  # (Cross compiling with zig wouldn't help here: verso links the system
+  # gstreamer/glib, which would need a full arm64 multiarch sysroot.)
   build-linux:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: Swatinem/rust-cache@v2
 
       # https://github.com/servo/servo/blob/a0730d7154e183a9b2d9a9282061e6c67d87a263/.github/workflows/linux.yml#L141
       - name: Set LIBCLANG_PATH # This is needed for bindgen in mozangle.
-        run: echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+        run: echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> $GITHUB_ENV
 
       - name: Install dependencies
         run: |
@@ -34,43 +46,51 @@ jobs:
             libgstrtspserver-1.0-dev gstreamer1.0-tools libges-1.0-dev \
             libharfbuzz-dev liblzma-dev libunwind-dev libvulkan1 \
             libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxmu-dev libxmu6 libegl1-mesa-dev llvm-dev m4 xorg-dev sway \
+            libxmu-dev libxmu6 libegl1-mesa-dev llvm-dev libclang-dev m4 xorg-dev sway \
 
       - name: Install Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v10
 
       - name: Build
         run: cargo build --profile release-lto
 
       - name: Make archive
         working-directory: ./target/release-lto
-        run: tar -czvf verso-x86_64-unknown-linux-gnu.tar.gz versoview
+        run: tar -czvf verso-${{ matrix.target }}.tar.gz versoview
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: verso-x86_64-unknown-linux-gnu
-          path: ./target/release-lto/verso-x86_64-unknown-linux-gnu.tar.gz
+          name: verso-${{ matrix.target }}
+          path: ./target/release-lto/verso-${{ matrix.target }}.tar.gz
 
+  # aarch64 is cross compiled on the x64 runner with the MSVC ARM64 build tools
+  # shipped in the GitHub runner image. (zig/zigbuild can't produce MSVC ABI binaries.)
   build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v10
 
       # Mozangle needs Clang 19+
       # see https://github.com/tauri-apps/verso/actions/runs/15916377747/job/44894669786?pr=20
@@ -79,38 +99,42 @@ jobs:
         with:
           version: "20"
 
+      - name: Add rust target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build
-        run: cargo build --profile release-lto
+        run: cargo build --target ${{ matrix.target }} --profile release-lto
 
       - name: Make archive
-        working-directory: ./target/release-lto
-        run: tar -czvf verso-x86_64-pc-windows-msvc.tar.gz versoview.exe
+        working-directory: ./target/${{ matrix.target }}/release-lto
+        run: tar -czvf verso-${{ matrix.target }}.tar.gz versoview.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: verso-x86_64-pc-windows-msvc
-          path: ./target/release-lto/verso-x86_64-pc-windows-msvc.tar.gz
+          name: verso-${{ matrix.target }}
+          path: ./target/${{ matrix.target }}/release-lto/verso-${{ matrix.target }}.tar.gz
 
   build-mac:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
           - target: x86_64-apple-darwin
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v10
 
       - name: Install dependencies
         run: |
@@ -130,7 +154,7 @@ jobs:
         run: tar -czvf verso-${{ matrix.target }}.tar.gz versoview
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: verso-${{ matrix.target }}
           path: ./target/${{ matrix.target }}/release-lto/verso-${{ matrix.target }}.tar.gz
@@ -142,8 +166,8 @@ jobs:
       - build-windows
       - build-mac
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
           path: artifacts
